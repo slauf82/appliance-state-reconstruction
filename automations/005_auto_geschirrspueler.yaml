@@ -1,0 +1,1504 @@
+############################################################
+# 🧼 SIEMENS GESCHIRRSPÜLER – KOMPLETTAUTOMATION
+# FINAL STABIL + LOCAL FIRST + EVENT STORM PROTECTION
+############################################################
+
+############################################################
+# 1️⃣ HA START → ROBUSTER INITIAL SYNC
+############################################################
+- alias: Geschirrspüler HA Start Initial Sync
+  id: geschirrspueler_start_sync
+
+  trigger:
+    - platform: homeassistant
+      event: start
+
+  action:
+
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.geschirrspuler_ha_start_aktiv
+
+    - delay: "00:00:25"
+
+    - service: homeassistant.update_entity
+      target:
+        entity_id:
+          - sensor.siemens_dishwasher_betriebszustand
+          - sensor.siemens_015010394376000612_bsh_common_status_operationstate
+          - binary_sensor.siemens_dishwasher_tur
+          - binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate
+          - switch.siemens_dishwasher_einschalter
+          - switch.siemens_015010394376000612_bsh_common_setting_powerstate
+          - switch.siemens_dishwasher_child_lock
+          - switch.siemens_015010394376000612_bsh_common_setting_childlock
+
+    - delay: "00:00:05"
+
+    - variables:
+
+        local_state: "{{ states('sensor.siemens_dishwasher_betriebszustand') }}"
+
+        cloud_state: >
+          {{ states('sensor.siemens_015010394376000612_bsh_common_status_operationstate').split('.')[-1] }}
+
+        raw_state: >
+          {% if local_state not in ['unknown','unavailable','none',''] %}
+            {{ local_state }}
+          {% else %}
+            {{ cloud_state }}
+          {% endif %}
+
+        mapped_state: >
+          {% set s = raw_state | lower %}
+          {% if s == 'run' %}
+            running
+          {% elif s == 'pause' %}
+            paused
+          {% else %}
+            {{ s }}
+          {% endif %}
+
+    - if:
+        - condition: template
+          value_template: >
+            {{ states('input_text.geschirrspuler_status') != 'finished'
+               and is_state('input_boolean.geschirrspuler_finished_lock','off')
+               and mapped_state not in ['unknown','unavailable','none',''] }}
+      then:
+
+        - service: input_text.set_value
+          target:
+            entity_id: input_text.geschirrspuler_status
+          data:
+            value: "{{ mapped_state }}"
+
+    - service: homeassistant.update_entity
+      target:
+        entity_id: sensor.geschirrspuler_status
+
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: >
+                {{ states('input_number.geschirrspuler_auto_recover_counter')
+                   in ['unknown','unavailable','none',''] }}
+          sequence:
+            - service: input_number.set_value
+              target:
+                entity_id: input_number.geschirrspuler_auto_recover_counter
+              data:
+                value: 0
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  HA Start Sync |
+                  Local={{ local_state }} |
+                  Cloud={{ cloud_state }} |
+                  Raw={{ raw_state }} |
+                  Gemappt={{ mapped_state }} |
+                  Status={{ states('input_text.geschirrspuler_status') }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+    - delay: "00:00:02"#
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.geschirrspuler_ha_start_aktiv
+
+
+############################################################
+# 2️⃣ STATUS SYNC HYBRID (EVENT + POLLING + SYNC INDICATOR)
+############################################################
+- alias: Geschirrspüler Status Sync Hybrid
+  id: geschirrspueler_sync_hybrid
+
+  trigger:
+
+    - platform: state
+      entity_id:
+        - sensor.siemens_dishwasher_betriebszustand
+
+    - platform: state
+      entity_id:
+        - sensor.siemens_015010394376000612_bsh_common_status_operationstate
+
+    - platform: time_pattern
+      seconds: "/30"
+
+  condition:
+
+    - condition: state
+      entity_id: input_boolean.geschirrspuler_event_lock
+      state: "off"
+
+  action:
+
+    ########################################################
+    # Sync sichtbar machen
+    ########################################################
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.geschirrspuler_sync_aktiv
+
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.geschirrspuler_event_lock
+
+    ########################################################
+    # Status lesen (Local First)
+    ########################################################
+    - variables:
+
+        local_state: "{{ states('sensor.siemens_dishwasher_betriebszustand') }}"
+
+        cloud_state: >
+          {{ states('sensor.siemens_015010394376000612_bsh_common_status_operationstate')
+             .split('.')[-1] }}
+
+        raw_state: >
+          {% if local_state not in ['unknown','unavailable','none',''] %}
+            {{ local_state }}
+          {% else %}
+            {{ cloud_state }}
+          {% endif %}
+
+        mapped_state: >
+          {% set s = raw_state | lower %}
+          {% if s == 'run' %}
+            running
+          {% elif s == 'pause' %}
+            paused
+          {% else %}
+            {{ s }}
+          {% endif %}
+
+        current_state: "{{ states('input_text.geschirrspuler_status') }}"
+
+        fertig_seit: >
+          {% set t = states('input_datetime.geschirrspuler_finished_time') %}
+          {% if states('input_text.geschirrspuler_status') == 'finished'
+                and t not in ['unknown','unavailable','none',''] %}
+            {% set diff = (now() - strptime(t, '%Y-%m-%d %H:%M:%S')).total_seconds() | int %}
+            {% set h = diff // 3600 %}
+            {% set m = (diff % 3600) // 60 %}
+            {% set s = diff % 60 %}
+            {{ '%02d:%02d:%02d' | format(h, m, s) }}
+          {% else %}
+            00:00:00
+          {% endif %}
+
+    ########################################################
+    # Status aktualisieren
+    ########################################################
+    - if:
+        - condition: template
+          value_template: >
+            {{ mapped_state != current_state
+               and mapped_state not in ['unknown','unavailable','none',''] }}
+      then:
+
+        - choose:
+
+            - conditions:
+                - condition: state
+                  entity_id: input_boolean.geschirrspuler_finished_lock
+                  state: "on"
+
+                - condition: template
+                  value_template: "{{ mapped_state != 'finished' }}"
+              sequence:
+                - stop: "Finished Lock aktiv"
+
+        - service: input_text.set_value
+          target:
+            entity_id: input_text.geschirrspuler_status
+          data:
+            value: "{{ mapped_state }}"
+
+        - service: homeassistant.update_entity
+          target:
+            entity_id: sensor.geschirrspuler_status
+
+    ########################################################
+    # Diagnose schreiben
+    ########################################################
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Sync läuft |
+                  Raw={{ raw_state }} |
+                  Gemappt={{ mapped_state }} |
+                  Status={{ states('input_text.geschirrspuler_status') }} |
+                  Local={{ local_state }} |
+                  Cloud={{ cloud_state }} |
+                  Fertig seit={{ fertig_seit }} |
+                  Zähler={{ states('input_number.geschirrspuler_auto_recover_counter') | int(0) }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+    ########################################################
+    # Locks wieder freigeben
+    ########################################################
+    - delay: "00:00:02"
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.geschirrspuler_event_lock
+          - input_boolean.geschirrspuler_sync_aktiv
+
+
+############################################################
+# 3️⃣ FINISHED ERKENNEN
+############################################################
+- alias: Geschirrspüler Programm beendet erkennen
+  id: geschirrspueler_finished_detect
+
+  trigger:
+    - platform: state
+      entity_id: input_text.geschirrspuler_status
+      to: "finished"
+
+  action:
+
+    - service: input_boolean.turn_on
+      target:
+        entity_id:
+          - input_boolean.geschirrspuler_finished_aktiv
+          - input_boolean.geschirrspuler_finished_lock
+
+    - service: input_datetime.set_datetime
+      target:
+        entity_id: input_datetime.geschirrspuler_finished_time
+      data:
+        datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Programm fertig erkannt |
+                  Finished Lock aktiv |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+    - delay: "00:00:02"
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.geschirrspuler_finished_aktiv
+
+
+############################################################
+# 4️⃣ EXTRA MODUS
+############################################################
+- alias: Geschirrspüler Extra Modus aktivieren
+  id: geschirrspueler_extra_modus
+
+  trigger:
+    - platform: state
+      entity_id: input_text.geschirrspuler_status
+      to: "finished"
+
+  action:
+
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.geschirrspuler_watcher_aktiv
+
+    - delay: "00:00:05"
+
+    - choose:
+
+        ####################################################
+        # LOCAL FIRST
+        ####################################################
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.siemens_dishwasher_verbindung
+              state: "on"
+          sequence:
+            - service: switch.turn_on
+              target:
+                entity_id: switch.siemens_dishwasher_einschalter
+
+            - delay: "00:00:02"
+
+            - service: switch.turn_on
+              target:
+                entity_id: switch.siemens_dishwasher_child_lock
+
+      ######################################################
+      # CLOUD FALLBACK
+      ######################################################
+      default:
+
+        - service: switch.turn_on
+          target:
+            entity_id: switch.siemens_015010394376000612_bsh_common_setting_powerstate
+
+        - delay: "00:00:02"
+
+        - service: switch.turn_on
+          target:
+            entity_id: switch.siemens_015010394376000612_bsh_common_setting_childlock
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Extra Modus aktiviert |
+                  Quelle={% if is_state('binary_sensor.siemens_dishwasher_verbindung','on') %}Local{% else %}Cloud{% endif %} |
+                  Einschalter & Kindersicherung an |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+    - delay: "00:00:02"
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.geschirrspuler_watcher_aktiv
+
+
+############################################################
+# 5️⃣ AUTO-OFF RECOVERY
+############################################################
+- alias: Geschirrspüler Auto-Off Recovery
+  id: geschirrspueler_auto_recover
+
+  trigger:
+    - platform: state
+      entity_id:
+        - switch.siemens_dishwasher_einschalter
+        - switch.siemens_015010394376000612_bsh_common_setting_powerstate
+      to: "off"
+      for: "00:00:05"
+
+  condition:
+    - condition: state
+      entity_id: input_text.geschirrspuler_status
+      state: "finished"
+
+    - condition: template
+      value_template: >
+        {% set local_door = states('binary_sensor.siemens_dishwasher_tur') %}
+        {% set cloud_door = states('binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate') %}
+        {% if local_door not in ['unknown','unavailable','none',''] %}
+          {{ local_door == 'off' }}
+        {% else %}
+          {{ cloud_door == 'off' }}
+        {% endif %}
+
+  action:
+
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.geschirrspuler_auto_recover_aktiv
+
+    - delay: "00:00:05"
+
+    - choose:
+
+        ####################################################
+        # LOCAL FIRST
+        ####################################################
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.siemens_dishwasher_verbindung
+              state: "on"
+          sequence:
+            - service: switch.turn_on
+              target:
+                entity_id: switch.siemens_dishwasher_einschalter
+
+            - delay: "00:00:02"
+
+            - service: switch.turn_on
+              target:
+                entity_id: switch.siemens_dishwasher_child_lock
+
+      ######################################################
+      # CLOUD FALLBACK
+      ######################################################
+      default:
+
+        - service: switch.turn_on
+          target:
+            entity_id: switch.siemens_015010394376000612_bsh_common_setting_powerstate
+
+        - delay: "00:00:02"
+
+        - service: switch.turn_on
+          target:
+            entity_id: switch.siemens_015010394376000612_bsh_common_setting_childlock
+
+    ########################################################
+    # FIX: Zähler sicher erhöhen und sichtbar machen
+    ########################################################
+    - variables:
+        new_recover_count: >
+          {{ states('input_number.geschirrspuler_auto_recover_counter') | int(0) + 1 }}
+
+        fertig_seit: >
+          {% set t = states('input_datetime.geschirrspuler_finished_time') %}
+          {% if t not in ['unknown','unavailable','none',''] %}
+            {% set diff = (now() - strptime(t, '%Y-%m-%d %H:%M:%S')).total_seconds() | int %}
+            {% set h = diff // 3600 %}
+            {% set m = (diff % 3600) // 60 %}
+            {% set s = diff % 60 %}
+            {{ '%02d:%02d:%02d' | format(h, m, s) }}
+          {% else %}
+            00:00:00
+          {% endif %}
+
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.geschirrspuler_auto_recover_counter
+      data:
+        value: "{{ new_recover_count }}"
+
+    - delay: "00:00:01"
+
+    - service: homeassistant.update_entity
+      target:
+        entity_id: input_number.geschirrspuler_auto_recover_counter
+
+    - delay: "00:00:01"
+
+    ########################################################
+    # Diagnose
+    ########################################################
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Auto-Off erkannt & Recovery |
+                  Quelle={% if is_state('binary_sensor.siemens_dishwasher_verbindung','on') %}Local{% else %}Cloud{% endif %} |
+                  Zähler={{ new_recover_count }} |
+                  Fertig seit={{ fertig_seit }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+    - delay: "00:00:02"
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.geschirrspuler_auto_recover_aktiv
+
+
+############################################################
+# 6️⃣ TÜR GEÖFFNET → RESET (LOCAL FIRST + LOCK RESET)
+############################################################
+- alias: Geschirrspüler Tür geöffnet Reset
+  id: geschirrspueler_tuer_reset
+
+  trigger:
+    - platform: state
+      entity_id:
+        - binary_sensor.siemens_dishwasher_tur
+        - binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate
+      to: "on"
+
+  action:
+
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.geschirrspuler_tuer_reset_aktiv
+
+    - choose:
+
+        ####################################################
+        # LOCAL FIRST
+        ####################################################
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.siemens_dishwasher_verbindung
+              state: "on"
+
+          sequence:
+
+            - service: switch.turn_off
+              target:
+                entity_id:
+                  - switch.siemens_dishwasher_child_lock
+                  - switch.siemens_dishwasher_einschalter
+
+      ######################################################
+      # CLOUD FALLBACK
+      ######################################################
+      default:
+
+        - service: switch.turn_off
+          target:
+            entity_id:
+              - switch.siemens_015010394376000612_bsh_common_setting_childlock
+              - switch.siemens_015010394376000612_bsh_common_setting_powerstate
+
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.geschirrspuler_status
+      data:
+        value: "ready"
+
+    - service: homeassistant.update_entity
+      target:
+        entity_id: sensor.geschirrspuler_status
+
+    - service: input_number.set_value
+      target:
+        entity_id: input_number.geschirrspuler_auto_recover_counter
+      data:
+        value: 0
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id:
+          - input_boolean.geschirrspuler_finished_lock
+          - input_boolean.geschirrspuler_event_lock
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Tür geöffnet → Reset |
+                  Status={{ states('input_text.geschirrspuler_status') }} |
+                  Finished Lock aus |
+                  Event Lock aus |
+                  Zähler=0 |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+    - delay: "00:00:02"
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.geschirrspuler_tuer_reset_aktiv
+
+
+############################################################
+# 7️⃣ READY DARF FINISHED NICHT ÜBERSCHREIBEN
+############################################################
+- alias: Geschirrspüler Ready Schutz
+  id: geschirrspueler_ready_schutz
+
+  trigger:
+    - platform: state
+      entity_id:
+        - sensor.siemens_dishwasher_betriebszustand
+        - sensor.siemens_015010394376000612_bsh_common_status_operationstate
+
+  condition:
+
+    - condition: template
+      value_template: >
+        {% set s = trigger.to_state.state.split('.')[-1] %}
+        {{ s | lower == 'ready'
+           and states('input_text.geschirrspuler_status') != 'finished'
+           and is_state('input_boolean.geschirrspuler_finished_lock','off') }}
+
+  action:
+
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.geschirrspuler_reset_aktiv
+
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.geschirrspuler_status
+      data:
+        value: "ready"
+
+    - service: homeassistant.update_entity
+      target:
+        entity_id: sensor.geschirrspuler_status
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Ready Schutz |
+                  Status=ready |
+                  Quelle={{ trigger.entity_id }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+    - delay: "00:00:02"
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.geschirrspuler_reset_aktiv
+
+
+############################################################
+# 8️⃣ OFFLINE-HINWEIS
+############################################################
+- alias: Geschirrspüler Fertig Offline Hinweis
+  id: geschirrspueler_offline_hinweis
+
+  trigger:
+    - platform: state
+      entity_id: input_text.geschirrspuler_status
+      to: "finished"
+
+  condition:
+    - condition: template
+      value_template: >
+        {% set local_conn = states('binary_sensor.siemens_dishwasher_verbindung') %}
+        {% set cloud_conn = states('binary_sensor.siemens_015010394376000612_connected') %}
+        {{ local_conn in ['off','unavailable','unknown','none','']
+           and cloud_conn in ['off','unavailable','unknown','none',''] }}
+
+  action:
+
+    - service: input_boolean.turn_on
+      target:
+        entity_id: input_boolean.geschirrspuler_offline_aktiv
+
+    - service: persistent_notification.create
+      data:
+        title: "Geschirrspüler fertig (offline)"
+        message: >
+          Programm beendet.
+          Local und Cloud sind aktuell nicht erreichbar.
+          Status wird lokal in Home Assistant gehalten bis zur Türöffnung.
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Offline Hinweis |
+                  Programm fertig |
+                  Local={{ states('binary_sensor.siemens_dishwasher_verbindung') }} |
+                  Cloud={{ states('binary_sensor.siemens_015010394376000612_connected') }} |
+                  Status={{ states('input_text.geschirrspuler_status') }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+    - delay: "00:00:02"
+
+    - service: input_boolean.turn_off
+      target:
+        entity_id: input_boolean.geschirrspuler_offline_aktiv
+
+
+############################################################
+# 9️⃣ VERBRAUCH NACH PROGRAMMENDE ÜBERNEHMEN
+############################################################
+- alias: Geschirrspüler Verbrauch speichern
+  id: geschirrspueler_verbrauch_speichern
+
+  trigger:
+    - platform: state
+      entity_id: input_text.geschirrspuler_status
+      to: "finished"
+
+  action:
+
+    - service: homeassistant.update_entity
+      target:
+        entity_id:
+          - sensor.siemens_dishwasher_energy_forecast
+          - sensor.siemens_015010394376000612_bsh_common_option_energyforecast
+          - sensor.siemens_dishwasher_water_forecast
+          - sensor.siemens_015010394376000612_bsh_common_option_waterforecast
+          - sensor.geschirrspuler_energie_letzter_lauf
+          - sensor.geschirrspuler_wasser_letzter_lauf
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Verbrauch nach Programmende aktualisiert |
+                  Energie lokal={{ states('sensor.siemens_dishwasher_energy_forecast') }} |
+                  Energie Cloud={{ states('sensor.siemens_015010394376000612_bsh_common_option_energyforecast') }} |
+                  Wasser lokal={{ states('sensor.siemens_dishwasher_water_forecast') }} |
+                  Wasser Cloud={{ states('sensor.siemens_015010394376000612_bsh_common_option_waterforecast') }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 🔟 LETZTES PROGRAMM BEI START SPEICHERN
+############################################################
+- alias: Geschirrspüler Programm bei Start speichern
+  id: geschirrspueler_programm_start_save
+
+  trigger:
+    ########################################################
+    # LOCAL EVENT
+    ########################################################
+    - platform: state
+      entity_id: sensor.siemens_dishwasher_betriebszustand
+      to: "Run"
+
+    ########################################################
+    # CLOUD EVENT
+    ########################################################
+    - platform: state
+      entity_id: sensor.siemens_015010394376000612_bsh_common_status_operationstate
+      to: "BSH.Common.EnumType.OperationState.Run"
+
+  action:
+
+    - variables:
+
+        local_program: "{{ states('select.siemens_dishwasher_ausgewahltes_programm') }}"
+
+        cloud_program: "{{ states('select.siemens_015010394376000612_programs') }}"
+
+        selected_program: >
+          {% if local_program not in ['unknown','unavailable','none',''] %}
+            {{ local_program }}
+          {% elif cloud_program not in ['unknown','unavailable','none',''] %}
+            {{ cloud_program }}
+          {% else %}
+            Auto 2
+          {% endif %}
+
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.geschirrspuler_last_program
+      data:
+        value: "{{ selected_program }}"
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Programm gestartet →
+                  gespeichert={{ selected_program }} |
+                  Local={{ local_program }} |
+                  Cloud={{ cloud_program }} |
+                  Quelle={{ trigger.entity_id }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 1️⃣1️⃣ PROGRAMM AUTOMATISCH SETZEN
+############################################################
+- alias: Geschirrspüler Programm automatisch setzen
+  id: geschirrspueler_programm_restore
+
+  trigger:
+    ########################################################
+    # LOCAL POWER ON
+    ########################################################
+    - platform: state
+      entity_id: switch.siemens_dishwasher_einschalter
+      to: "on"
+
+    ########################################################
+    # CLOUD POWER ON
+    ########################################################
+    - platform: state
+      entity_id: switch.siemens_015010394376000612_bsh_common_setting_powerstate
+      to: "on"
+
+  condition:
+
+    ########################################################
+    # Tür geschlossen, local first / cloud fallback
+    ########################################################
+    - condition: template
+      value_template: >
+        {% set local_door = states('binary_sensor.siemens_dishwasher_tur') %}
+        {% set cloud_door = states('binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate') %}
+        {% if local_door not in ['unknown','unavailable','none',''] %}
+          {{ local_door == 'off' }}
+        {% else %}
+          {{ cloud_door == 'off' }}
+        {% endif %}
+
+    ########################################################
+    # Nur wenn nicht laufend
+    ########################################################
+    - condition: template
+      value_template: >
+        {{ states('input_text.geschirrspuler_status') in ['ready','finished'] }}
+
+  action:
+
+    ########################################################
+    # Kurze Stabilisierung nach Power ON
+    ########################################################
+    - delay: "00:00:04"
+
+    ########################################################
+    # Prüfen ob Gerät noch eingeschaltet ist
+    ########################################################
+    - condition: template
+      value_template: >
+        {% set local_power = states('switch.siemens_dishwasher_einschalter') %}
+        {% set cloud_power = states('switch.siemens_015010394376000612_bsh_common_setting_powerstate') %}
+        {{ local_power == 'on' or cloud_power == 'on' }}
+
+    - variables:
+
+        last_program_raw: "{{ states('input_text.geschirrspuler_last_program') }}"
+
+        last_program: >
+          {% if last_program_raw not in ['unknown','unavailable','none',''] %}
+            {{ last_program_raw }}
+          {% else %}
+            Auto 2
+          {% endif %}
+
+    ########################################################
+    # Programm setzen – LOCAL FIRST / CLOUD FALLBACK
+    ########################################################
+    - choose:
+
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.siemens_dishwasher_verbindung
+              state: "on"
+
+          sequence:
+
+            - service: select.select_option
+              target:
+                entity_id: select.siemens_dishwasher_ausgewahltes_programm
+              data:
+                option: "{{ last_program }}"
+
+      default:
+
+        - service: select.select_option
+          target:
+            entity_id: select.siemens_015010394376000612_programs
+          data:
+            option: "{{ last_program }}"
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Programm automatisch gesetzt |
+                  Programm={{ last_program }} |
+                  Quelle={% if is_state('binary_sensor.siemens_dishwasher_verbindung','on') %}Local{% else %}Cloud{% endif %} |
+                  Trigger={{ trigger.entity_id }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 1️⃣2️⃣ HOME CONNECT LOCAL PROFIL WATCHDOG
+############################################################
+- alias: Geschirrspüler HomeConnect Profil Watchdog
+  id: geschirrspuler_homeconnect_profile_watchdog
+
+  trigger:
+    - platform: time_pattern
+      minutes: "/30"
+
+  condition:
+    - condition: template
+      value_template: >
+        {{ not is_state('binary_sensor.siemens_dishwasher_verbindung','on') }}
+
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "HomeConnect Profil Restore"
+        message: "Gerät nicht erreichbar – Profil wird neu geladen"
+
+    - delay: "00:00:10"
+
+    - service: shell_command.homeconnect_restore_profile
+
+
+############################################################
+# 1️⃣3️⃣ WATCHDOG STUFE 1 – ENTITY REFRESH
+############################################################
+- alias: Geschirrspüler Watchdog Entity Refresh
+  id: geschirrspuler_watchdog_refresh
+
+  trigger:
+    - platform: time_pattern
+      minutes: "/3"
+
+  condition:
+    - condition: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      state: "on"
+
+  action:
+    - service: homeassistant.update_entity
+      target:
+        entity_id:
+          - sensor.siemens_dishwasher_betriebszustand
+          - sensor.siemens_dishwasher_programmphase
+          - sensor.siemens_dishwasher_programmfortschritt
+          - sensor.siemens_dishwasher_verbleibende_programmlaufzeit
+          - binary_sensor.siemens_dishwasher_tur
+          - switch.siemens_dishwasher_einschalter
+          - switch.siemens_dishwasher_child_lock
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Watchdog Stufe 1 |
+                  Local Entity Refresh |
+                  Verbindung={{ states('binary_sensor.siemens_dishwasher_verbindung') }} |
+                  Zustand={{ states('sensor.siemens_dishwasher_betriebszustand') }} |
+                  Fortschritt={{ states('sensor.siemens_dishwasher_programmfortschritt') }} |
+                  Restlaufzeit={{ states('sensor.siemens_dishwasher_verbleibende_programmlaufzeit') }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 1️⃣4️⃣ WATCHDOG STUFE 2 – INTEGRATION RELOAD
+############################################################
+- alias: Geschirrspüler Watchdog Reload
+  id: geschirrspueler_watchdog_reload
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "off"
+      for: "00:05:00"
+
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "unavailable"
+      for: "00:05:00"
+
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "unknown"
+      for: "00:05:00"
+
+  action:
+    - service: system_log.write
+      data:
+        message: "Geschirrspüler Integration wird neu geladen (Watchdog)"
+        level: warning
+
+    - service: homeassistant.reload_config_entry
+      data:
+        entry_id: 01KJN7W3WKNH8NNN0S0YPC5T9S
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Watchdog Stufe 2 |
+                  Integration Reload ausgelöst |
+                  Verbindung={{ states('binary_sensor.siemens_dishwasher_verbindung') }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 1️⃣5️⃣ WATCHDOG STUFE 3 – HARD RESET
+############################################################
+- alias: Geschirrspüler Watchdog Hard Reset
+  id: geschirrspuler_watchdog_hard_reset
+
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "off"
+      for: "00:30:00"
+
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "unavailable"
+      for: "00:30:00"
+
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "unknown"
+      for: "00:30:00"
+
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Geschirrspüler Hard Reset"
+        message: "Integration wird komplett neu gestartet"
+
+    - service: homeassistant.reload_config_entry
+      data:
+        entry_id: 01KJN7W3WKNH8NNN0S0YPC5T9S
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Watchdog Stufe 3 |
+                  Hard Reset / Reload ausgelöst |
+                  Verbindung={{ states('binary_sensor.siemens_dishwasher_verbindung') }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 1️⃣6️⃣ GESCHIRRSPÜLER KOMMUNIKATION KOMPLETT AUSGEFALLEN
+############################################################
+- alias: Geschirrspüler Kommunikationsausfall
+  id: geschirrspueler_kommunikation_tot
+
+  trigger:
+    - platform: time_pattern
+      minutes: "/2"
+
+  condition:
+
+    - condition: template
+      value_template: >
+        {% set dead = ['unavailable','unknown','none',''] %}
+        {% set bad_conn = ['off','unavailable','unknown','none',''] %}
+
+        {% set local_conn = states('binary_sensor.siemens_dishwasher_verbindung') %}
+        {% set cloud_conn = states('binary_sensor.siemens_015010394376000612_connected') %}
+
+        {% set local_door = states('binary_sensor.siemens_dishwasher_tur') %}
+        {% set cloud_door = states('binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate') %}
+
+        {% set local_state = states('sensor.siemens_dishwasher_betriebszustand') %}
+        {% set cloud_state = states('sensor.siemens_015010394376000612_bsh_common_status_operationstate') %}
+
+        {% set local_child = states('switch.siemens_dishwasher_child_lock') %}
+        {% set cloud_child = states('binary_sensor.siemens_015010394376000612_bsh_common_setting_childlock') %}
+
+        {% set local_remaining = states('sensor.siemens_dishwasher_verbleibende_programmlaufzeit') %}
+        {% set cloud_remaining = states('sensor.siemens_015010394376000612_bsh_common_option_remainingprogramtime') %}
+
+        {% set local_progress = states('sensor.siemens_dishwasher_programmfortschritt') %}
+        {% set cloud_progress = states('sensor.siemens_015010394376000612_bsh_common_option_programprogress') %}
+
+        {{
+          local_conn in bad_conn
+          and cloud_conn in bad_conn
+          and local_door in dead
+          and cloud_door in dead
+          and local_state in dead
+          and cloud_state in dead
+          and local_child in dead
+          and cloud_child in dead
+          and local_remaining in dead
+          and cloud_remaining in dead
+          and local_progress in dead
+          and cloud_progress in dead
+        }}
+
+  action:
+
+    - service: persistent_notification.create
+      data:
+        title: "Geschirrspüler Kommunikation ausgefallen"
+        message: >
+          Weder Local noch Cloud liefern verwertbare Daten.
+
+          Verbindung, Türstatus, Betriebszustand, Kinderschutz,
+          Restlaufzeit und Programmfortschritt sind nicht mehr verfügbar.
+
+          Vermutlich hängt das Kommunikationsmodul des Geschirrspülers.
+
+          Bitte Sicherung des Geschirrspülers kurz AUS und wieder EIN schalten.
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Kommunikationsausfall |
+                  Local Verbindung={{ states('binary_sensor.siemens_dishwasher_verbindung') }} |
+                  Cloud Verbindung={{ states('binary_sensor.siemens_015010394376000612_connected') }} |
+                  Local Zustand={{ states('sensor.siemens_dishwasher_betriebszustand') }} |
+                  Cloud Zustand={{ states('sensor.siemens_015010394376000612_bsh_common_status_operationstate') }} |
+                  Sicherung AUS/EIN empfohlen |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 1️⃣7️⃣ INKONSISTENTER ZUSTAND FIX (READY + CHILDLOCK + AUS)
+############################################################
+- alias: Geschirrspüler Inkonsistenz Fix
+  id: geschirrspueler_inconsistency_fix
+
+  trigger:
+    - platform: time_pattern
+      minutes: "/1"
+
+  condition:
+
+    - condition: template
+      value_template: >
+        {% set status = states('input_text.geschirrspuler_status') %}
+
+        {% set power_local = states('switch.siemens_dishwasher_einschalter') %}
+        {% set power_cloud = states('switch.siemens_015010394376000612_bsh_common_setting_powerstate') %}
+
+        {% set lock_local = states('switch.siemens_dishwasher_child_lock') %}
+        {% set lock_cloud = states('switch.siemens_015010394376000612_bsh_common_setting_childlock') %}
+        {% set lock_cloud_binary = states('binary_sensor.siemens_015010394376000612_bsh_common_setting_childlock') %}
+
+        {{ status == 'ready'
+           and (
+             lock_local == 'on'
+             or lock_cloud == 'on'
+             or lock_cloud_binary == 'on'
+           )
+           and (
+             (power_local == 'off' or power_local in ['unknown','unavailable','none',''])
+             and (power_cloud == 'off' or power_cloud in ['unknown','unavailable','none',''])
+           )
+        }}
+
+  action:
+
+    ########################################################
+    # Versuch: Gerät korrekt einschalten
+    ########################################################
+    - choose:
+
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.siemens_dishwasher_verbindung
+              state: "on"
+          sequence:
+
+            - service: switch.turn_on
+              target:
+                entity_id: switch.siemens_dishwasher_einschalter
+
+      default:
+
+        - service: switch.turn_on
+          target:
+            entity_id: switch.siemens_015010394376000612_bsh_common_setting_powerstate
+
+    - delay: "00:00:03"
+
+    ########################################################
+    # Sicherstellen dass Child Lock konsistent bleibt
+    ########################################################
+    - choose:
+
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.siemens_dishwasher_verbindung
+              state: "on"
+          sequence:
+
+            - service: switch.turn_on
+              target:
+                entity_id: switch.siemens_dishwasher_child_lock
+
+      default:
+
+        - service: switch.turn_on
+          target:
+            entity_id: switch.siemens_015010394376000612_bsh_common_setting_childlock
+
+    ########################################################
+    # Diagnose
+    ########################################################
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Inkonsistenz erkannt & korrigiert |
+                  READY + CHILDLOCK + AUS |
+                  Power Local={{ states('switch.siemens_dishwasher_einschalter') }} |
+                  Power Cloud={{ states('switch.siemens_015010394376000612_bsh_common_setting_powerstate') }} |
+                  Lock Local={{ states('switch.siemens_dishwasher_child_lock') }} |
+                  Lock Cloud={{ states('switch.siemens_015010394376000612_bsh_common_setting_childlock') }} |
+                  Gerät wieder eingeschaltet |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 1️⃣8️⃣ HOME CONNECT CLOUD RELOAD / TOKEN WATCHDOG
+############################################################
+- alias: Geschirrspüler HomeConnect Cloud Reload Watchdog
+  id: geschirrspueler_homeconnect_cloud_reload_watchdog
+
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.siemens_015010394376000612_connected
+      to: "unavailable"
+      for: "00:05:00"
+
+    - platform: state
+      entity_id: binary_sensor.siemens_015010394376000612_connected
+      to: "unknown"
+      for: "00:05:00"
+
+    - platform: state
+      entity_id: binary_sensor.siemens_015010394376000612_connected
+      to: "off"
+      for: "00:10:00"
+
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Home Connect Cloud Reload"
+        message: "Cloud-Integration wird wegen Verbindungs-/Tokenproblem neu geladen."
+
+    - service: homeassistant.reload_config_entry
+      data:
+        entry_id: DEINE_CLOUD_ENTRY_ID
+
+
+############################################################
+# 1️⃣9️⃣ HEALTH CHECK / LEBENSZEICHEN-WÄCHTER
+############################################################
+- alias: Geschirrspüler Health Check
+  id: geschirrspuler_health_check
+
+  trigger:
+    - platform: time_pattern
+      minutes: "/10"
+
+  variables:
+
+    local_connected: >
+      {{ states('binary_sensor.siemens_015010394376000612_connected') }}
+
+    cloud_connected: >
+      {{ states('binary_sensor.siemens_dishwasher_verbindung') }}
+
+    local_state: >
+      {{ states('sensor.siemens_015010394376000612_bsh_common_status_operationstate') }}
+
+    cloud_state: >
+      {{ states('sensor.siemens_dishwasher_betriebszustand') }}
+
+    local_door: >
+      {{ states('binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate') }}
+
+    cloud_door: >
+      {{ states('binary_sensor.siemens_dishwasher_tur') }}
+
+  condition:
+    - condition: template
+      value_template: >
+        {{
+          local_connected in ['off','unknown','unavailable']
+          and
+          cloud_connected in ['off','unknown','unavailable']
+          and
+          local_state in ['unknown','unavailable']
+          and
+          cloud_state in ['unknown','unavailable']
+          and
+          local_door in ['unknown','unavailable']
+          and
+          cloud_door in ['unknown','unavailable']
+        }}
+
+  action:
+
+    - service: persistent_notification.create
+      data:
+        title: "Geschirrspüler Health Check"
+        message: >
+          Keine Cloud- und keine Local-Daten mehr verfügbar.
+          Automatischer Wiederherstellungsversuch wird gestartet.
+
+    ########################################################
+    # Local Integration Reload
+    ########################################################
+
+    - service: homeassistant.reload_config_entry
+      data:
+        entry_id: 01KJN7W3WKNH8NNN0S0YPC5T9S
+
+    - delay: "00:01:00"
+
+    ########################################################
+    # Cloud Integration Reload
+    ########################################################
+
+    - service: homeassistant.reload_config_entry
+      data:
+        entry_id: 01KJDXNAG4GCCK3WW48FT8EMRH
+
+    - delay: "00:01:00"
+
+    ########################################################
+    # Diagnose
+    ########################################################
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Health Check ausgelöst |
+                  Local={{ local_connected }} |
+                  Cloud={{ cloud_connected }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 2️⃣0️⃣ HOME CONNECT ALT TOKEN RECOVERY
+############################################################
+- alias: Geschirrspüler Cloud Token Recovery
+  id: geschirrspuler_cloud_token_recovery
+
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "off"
+      for: "01:00:00"
+
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "unavailable"
+      for: "01:00:00"
+
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_verbindung
+      to: "unknown"
+      for: "01:00:00"
+
+  action:
+
+    - service: persistent_notification.create
+      data:
+        title: "Home Connect Alt Token Recovery"
+        message: >
+          Cloud Verbindung seit 60 Minuten nicht erreichbar.
+          Integration wird neu geladen.
+
+    ########################################################
+    # Cloud Integration Reload
+    ########################################################
+
+    - service: homeassistant.reload_config_entry
+      data:
+        entry_id: 01KJDXNAG4GCCK3WW48FT8EMRH
+
+    - delay: "00:00:30"
+
+    ########################################################
+    # Diagnose
+    ########################################################
+
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+              state: "on"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.geschirrspuler_diagnose
+              data:
+                value: >
+                  Cloud Token Recovery |
+                  Cloud={{ states('binary_sensor.siemens_dishwasher_verbindung') }} |
+                  Zeit={{ now().strftime('%H:%M:%S') }}

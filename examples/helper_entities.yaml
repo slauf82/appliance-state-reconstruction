@@ -1,0 +1,4 @@
+input_text:
+  geschirrspuler_status:
+    name: Geschirrspüler Status
+    initial: ready
