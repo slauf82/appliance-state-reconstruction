@@ -1502,3 +1502,192 @@
                   Cloud Token Recovery |
                   Cloud={{ states('binary_sensor.siemens_dishwasher_verbindung') }} |
                   Zeit={{ now().strftime('%H:%M:%S') }}
+
+
+############################################################
+# 2️⃣1️⃣ NACHLEGEN – TÜR SCHLIESSEN → PROGRAMM FORTSETZEN
+############################################################
+# Zweck:
+# - Tür kann während eines laufenden Programms beliebig oft geöffnet werden.
+# - Die vorhandenen Automationen dürfen das Gerät dabei ausschalten und den
+#   rekonstruierten Status vorübergehend auf READY setzen.
+# - Beim erneuten Schließen wird ausschließlich der Einschalter aktiviert.
+# - Der Geschirrspüler setzt das unterbrochene Programm selbstständig fort.
+# - Nach bestätigter Fortsetzung wird der Nachlege-Merker zurückgesetzt,
+#   sodass derselbe Ablauf innerhalb eines Programms erneut möglich ist.
+############################################################
+- alias: Geschirrspüler Nachlegen Programm fortsetzen
+  id: geschirrspueler_nachlegen_fortsetzen
+  mode: restart
+
+  trigger:
+    ########################################################
+    # Race-Condition-Pfad 1:
+    # Der rekonstruierte Status wechselt bei offener Tür
+    # bereits von RUNNING auf READY.
+    ########################################################
+    - platform: state
+      entity_id: input_text.geschirrspuler_status
+      from: "running"
+      to: "ready"
+      id: unterbrochen
+
+    ########################################################
+    # Race-Condition-Pfad 2:
+    # Die Türöffnung wird erkannt, solange der Status noch
+    # RUNNING meldet.
+    ########################################################
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_tur
+      to: "on"
+      id: tuer_geoeffnet
+
+    - platform: state
+      entity_id: binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate
+      to: "on"
+      id: tuer_geoeffnet
+
+    ########################################################
+    # Tür nach dem Nachlegen wieder geschlossen.
+    ########################################################
+    - platform: state
+      entity_id: binary_sensor.siemens_dishwasher_tur
+      to: "off"
+      id: tuer_geschlossen
+
+    - platform: state
+      entity_id: binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate
+      to: "off"
+      id: tuer_geschlossen
+
+  action:
+    - choose:
+
+        ####################################################
+        # A) Unterbrechung durch Nachlegen merken
+        ####################################################
+        - conditions:
+            - condition: template
+              value_template: >
+                {{ trigger.id == 'unterbrochen'
+                   or (trigger.id == 'tuer_geoeffnet'
+                       and states('input_text.geschirrspuler_status') == 'running') }}
+
+            # Nur eine tatsächlich offene Tür darf den Merker setzen.
+            - condition: template
+              value_template: >
+                {% set local_door = states('binary_sensor.siemens_dishwasher_tur') %}
+                {% set cloud_door = states('binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate') %}
+                {% if local_door not in ['unknown','unavailable','none',''] %}
+                  {{ local_door == 'on' }}
+                {% else %}
+                  {{ cloud_door == 'on' }}
+                {% endif %}
+
+            # Ein echter FINISHED-Ablauf darf nicht als Nachlegen gelten.
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_finished_lock
+              state: "off"
+
+          sequence:
+            - service: input_boolean.turn_on
+              target:
+                entity_id: input_boolean.geschirrspuler_nachlegen_aktiv
+
+            - choose:
+                - conditions:
+                    - condition: state
+                      entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+                      state: "on"
+                  sequence:
+                    - service: input_text.set_value
+                      target:
+                        entity_id: input_text.geschirrspuler_diagnose
+                      data:
+                        value: >
+                          Nachlegen erkannt |
+                          Tür während laufendem Programm geöffnet |
+                          Fortsetzung nach Türschließen vorgemerkt |
+                          Zeit={{ now().strftime('%H:%M:%S') }}
+
+        ####################################################
+        # B) Tür wieder geschlossen → Gerät einschalten
+        ####################################################
+        - conditions:
+            - condition: trigger
+              id: tuer_geschlossen
+
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_nachlegen_aktiv
+              state: "on"
+
+            - condition: state
+              entity_id: input_boolean.geschirrspuler_finished_lock
+              state: "off"
+
+            # Schutz gegen widersprüchliche lokale/Cloud-Türwerte.
+            - condition: template
+              value_template: >
+                {% set local_door = states('binary_sensor.siemens_dishwasher_tur') %}
+                {% set cloud_door = states('binary_sensor.siemens_015010394376000612_bsh_common_status_doorstate') %}
+                {% if local_door not in ['unknown','unavailable','none',''] %}
+                  {{ local_door == 'off' }}
+                {% else %}
+                  {{ cloud_door == 'off' }}
+                {% endif %}
+
+          sequence:
+            ################################################
+            # LOCAL FIRST, CLOUD FALLBACK
+            ################################################
+            - choose:
+                - conditions:
+                    - condition: state
+                      entity_id: binary_sensor.siemens_dishwasher_verbindung
+                      state: "on"
+                  sequence:
+                    - service: switch.turn_on
+                      target:
+                        entity_id: switch.siemens_dishwasher_einschalter
+              default:
+                - service: switch.turn_on
+                  target:
+                    entity_id: switch.siemens_015010394376000612_bsh_common_setting_powerstate
+
+            ################################################
+            # Erfolg über echte Rückmeldung bestätigen.
+            # Der Einschalter oder der wieder laufende Status
+            # genügt; Home Connect kann beide in abweichender
+            # Reihenfolge melden.
+            ################################################
+            - wait_template: >
+                {{ is_state('switch.siemens_dishwasher_einschalter','on')
+                   or is_state('switch.siemens_015010394376000612_bsh_common_setting_powerstate','on')
+                   or states('input_text.geschirrspuler_status') == 'running' }}
+              timeout: "00:02:00"
+              continue_on_timeout: false
+
+            ################################################
+            # Merker erst nach bestätigtem Erfolg löschen.
+            # Dadurch ist beliebig häufiges Nachlegen möglich.
+            ################################################
+            - service: input_boolean.turn_off
+              target:
+                entity_id: input_boolean.geschirrspuler_nachlegen_aktiv
+
+            - choose:
+                - conditions:
+                    - condition: state
+                      entity_id: input_boolean.geschirrspuler_offline_diagnose_aktiv
+                      state: "on"
+                  sequence:
+                    - service: input_text.set_value
+                      target:
+                        entity_id: input_text.geschirrspuler_diagnose
+                      data:
+                        value: >
+                          Tür nach Nachlegen geschlossen |
+                          Gerät wieder eingeschaltet |
+                          Programm wird selbstständig fortgesetzt |
+                          Quelle={% if is_state('binary_sensor.siemens_dishwasher_verbindung','on') %}Local{% else %}Cloud{% endif %} |
+                          Zeit={{ now().strftime('%H:%M:%S') }}
